@@ -156,8 +156,7 @@ if best_df.empty:
 
 # 选取 AIC 最小的参数
 best_params = best_df.iloc[0]
-print('
-最优参数:')
+print('最优参数:')
 print(best_params)
 
 final_order = (int(best_params.p), int(best_params.d), int(best_params.q))
@@ -246,8 +245,7 @@ plt.show()
 # -----------------------------------------------
 # 小结 (打印)
 # -----------------------------------------------
-print('
-===== 模型选择与结果小结 =====')
+print('===== 模型选择与结果小结 =====')
 print(f'最优非季节参数 (p,d,q): {final_order}')
 print(f'最优季节参数 (P,D,Q,s): {final_seasonal}')
 print(f'最优模型 AIC: {best_df.iloc[0].AIC:.2f}')
