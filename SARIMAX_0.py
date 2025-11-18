@@ -10,12 +10,14 @@
 # 4. 自动挑选 AIC 最小的模型并输出详细 summary。
 # 5. 增加：原始序列图、差分图、ACF/PACF、季节分解、残差诊断、拟合 vs 实际、预测图。
 # 6. 数据质量检查：缺失、重复索引、频率设置。
+# 7. 新增：CPU 并行网格搜索 (joblib)，通过环境变量 SARIMAX_N_JOBS 控制并发数，默认使用全部核心。
 # ===============================================
 
 import warnings
 warnings.filterwarnings('ignore')
 
 # 基础库
+import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -31,6 +33,16 @@ from sklearn.metrics import mean_squared_error
 
 # 进度条 (终端)
 from tqdm import tqdm
+
+# 并行库
+from joblib import Parallel, delayed
+
+# 控制并行度：优先读环境变量
+def _get_n_jobs():
+    try:
+        return int(os.environ.get('SARIMAX_N_JOBS', '-1'))  # -1 表示使用全部核心
+    except Exception:
+        return -1
 
 # -----------------------------------------------
 # 读取数据并检查是否适用于 SARIMAX
@@ -128,18 +140,34 @@ for p in p_range:
 print(f'总参数组合数: {len(param_grid)}')
 
 # -----------------------------------------------
-# 优化函数：遍历所有组合，返回 AIC 排序结果
+# 并行优化函数：遍历所有组合，返回 AIC 排序结果
 # -----------------------------------------------
-def optimize_sarimax(endog, param_grid, maxiter=200):
-    results = []
-    for (p, d_, q, P, D_, Q, s_) in tqdm(param_grid, desc='参数搜索', ncols=80):
-        try:
-            model = SARIMAX(endog, order=(p, d_, q), seasonal_order=(P, D_, Q, s_))
-            fitted = model.fit(disp=False, maxiter=maxiter)
-            results.append({'p': p, 'd': d_, 'q': q, 'P': P, 'D': D_, 'Q': Q, 's': s_, 'AIC': fitted.aic})
-        except Exception as e:
-            # 可以根据需要打印错误调试：print(e)
-            continue
+
+def _fit_one(endog, order, seasonal_order, maxiter=200):
+    try:
+        model = SARIMAX(endog, order=order, seasonal_order=seasonal_order)
+        fitted = model.fit(disp=False, maxiter=maxiter)
+        return {
+            'p': order[0], 'd': order[1], 'q': order[2],
+            'P': seasonal_order[0], 'D': seasonal_order[1], 'Q': seasonal_order[2], 's': seasonal_order[3],
+            'AIC': fitted.aic
+        }
+    except Exception:
+        return None
+
+
+def optimize_sarimax_parallel(endog, param_grid, n_jobs=-1, maxiter=200):
+    # 任务列表
+    tasks = [((p, d_, q), (P, D_, Q, s_)) for (p, d_, q, P, D_, Q, s_) in param_grid]
+    print(f'使用 CPU 并行搜索，n_jobs={n_jobs} (可通过环境变量 SARIMAX_N_JOBS 覆盖)')
+    # 注意：为避免与 BLAS 多线程争抢，建议运行时设置 \n'
+    #       OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \n'
+    results = Parallel(n_jobs=n_jobs, backend='loky')(
+        delayed(_fit_one)(endog, order, seasonal, maxiter) for order, seasonal in tasks
+    )
+    results = [r for r in results if r is not None]
+    if not results:
+        return pd.DataFrame(columns=['p','d','q','P','D','Q','s','AIC'])
     return pd.DataFrame(results).sort_values('AIC').reset_index(drop=True)
 
 # 划分训练 / 测试集 (最后 N 条作为测试)
@@ -147,7 +175,8 @@ TEST_STEPS = 100
 train = data.iloc[:-TEST_STEPS]  # 留出最后 100 点做预测评估
 
 print('开始参数搜索...')
-best_df = optimize_sarimax(train['VALUE'], param_grid)
+N_JOBS = _get_n_jobs()
+best_df = optimize_sarimax_parallel(train['VALUE'], param_grid, n_jobs=N_JOBS)
 print('搜索完成，前 5 个最优结果:')
 print(best_df.head())
 
