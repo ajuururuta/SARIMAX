@@ -12,6 +12,7 @@
 # 6. 数据质量检查：缺失、重复索引、频率设置。  
 # 7. 新增：CPU 并行网格搜索 (joblib)，通过环境变量 SARIMAX_N_JOBS 控制并发数，默认使用全部核心。  
 # 8. 新增：在拟合调用处屏蔽特定 UserWarning（Non-stationary starting seasonal autoregressive / Non-invertible starting seasonal moving average / Non-stationary starting autoregressive parameters）。
+# 9. 新增：稳健拟合函数 + 优化器回退链；未收敛模型不参与 AIC 排序，减少 ConvergenceWarning。
 # ===============================================
 
 import warnings
@@ -45,6 +46,11 @@ def _get_n_jobs():
         return int(os.environ.get('SARIMAX_N_JOBS', '-1'))  # -1 表示使用全部核心
     except Exception:
         return -1
+
+# 为避免与 BLAS 抢线程，若用户未设置，则固定内部线程为 1
+for var in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"]:
+    if os.environ.get(var) is None:
+        os.environ[var] = "1"
 
 # 设置中文字体和图形样式
 plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Microsoft YaHei']  # 用来正常显示中文标签
@@ -89,7 +95,7 @@ data = raw.copy()
 # 平稳性检验 (ADF) & 差分
 # -----------------------------------------------
 adf_stat, adf_p, _, _, critical_values, _ = adfuller(data['VALUE'])
-print(f'原始序列 ADF Statistic: {adf_stat:.4f}, p-value: {adf_p:.4f}')
+print(f'原始序列 ADF Statistic: {adf_stat:.4f}, p-value: {adf_p:.50f}')
 if adf_p < 0.05:
     d = 0
     print('原始序列已平稳，d=0')
@@ -100,7 +106,7 @@ else:
 
 if d == 1:
     diff_adf_stat, diff_adf_p, *_ = adfuller(data['VALUE'].dropna().diff().dropna())
-    print(f'差分后 ADF Statistic: {diff_adf_stat:.4f}, p-value: {diff_adf_p:.4f}')
+    print(f'差分后 ADF Statistic: {diff_adf_stat:.4f}, p-value: {diff_adf_p:.50f}')
 
 # -----------------------------------------------
 # 参数搜索空间设置
@@ -126,54 +132,87 @@ for p in p_range:
 print(f'总参数组合数: {len(param_grid)}')
 
 # -----------------------------------------------
+# 稳健拟合函数：多优化器回退 + 可选 simple_differencing
+# -----------------------------------------------
+def _fit_robust(model, maxiter=200, stage='coarse'):
+    # stage: 'coarse' 使用较快回退；'fine' 使用更全方法
+    methods_coarse = ['lbfgs', 'powell']
+    methods_fine = ['lbfgs', 'powell', 'nm', 'bfgs', 'cg']
+    methods = methods_coarse if stage == 'coarse' else methods_fine
+
+    for m in methods:
+        try:
+            with warnings.catch_warnings():
+                # 屏蔽起始参数相关的特定告警（与最终收敛无关）
+                warnings.filterwarnings('ignore', message='Non-stationary starting seasonal autoregressive', category=UserWarning)
+                warnings.filterwarnings('ignore', message='Non-invertible starting seasonal moving average', category=UserWarning)
+                warnings.filterwarnings('ignore', message='Non-stationary starting autoregressive parameters', category=UserWarning)
+                res = model.fit(method=m, disp=False, maxiter=maxiter)
+            converged = bool(res.mle_retvals.get('converged', True))
+            if converged and np.isfinite(res.aic):
+                return res
+        except Exception:
+            continue
+    return None
+
+def _build_model(endog, order, seasonal_order, simple_diff=False):
+    return SARIMAX(
+        endog,
+        order=order,
+        seasonal_order=seasonal_order,
+        enforce_stationarity=True,
+        enforce_invertibility=True,
+        simple_differencing=simple_diff
+    )
+
+# -----------------------------------------------
 # 并行优化函数：遍历所有组合，返回 AIC 排序结果
 # -----------------------------------------------
-
 def _fit_one(endog, order, seasonal_order, maxiter=200):
-    try:
-        model = SARIMAX(
-            endog,
-            order=order,
-            seasonal_order=seasonal_order,
-            enforce_stationarity=True,
-            enforce_invertibility=True,
-        )
-        with warnings.catch_warnings():
-            warnings.filterwarnings('ignore', message='Non-stationary starting seasonal autoregressive', category=UserWarning)
-            warnings.filterwarnings('ignore', message='Non-invertible starting seasonal moving average', category=UserWarning)
-            warnings.filterwarnings('ignore', message='Non-stationary starting autoregressive parameters', category=UserWarning)
-            fitted = model.fit(disp=False, maxiter=maxiter)
-        return {
-            'p': order[0], 'd': order[1], 'q': order[2],
-            'P': seasonal_order[0], 'D': seasonal_order[1], 'Q': seasonal_order[2], 's': seasonal_order[3],
-            'AIC': fitted.aic
-        }
-    except Exception:
+    # 优先用不做 simple_differencing 的模型
+    model = _build_model(endog, order, seasonal_order, simple_diff=False)
+    res = _fit_robust(model, maxiter=maxiter, stage='coarse')
+    if res is None and (order[1] > 0 or seasonal_order[1] > 0):
+        # 尝试 simple_differencing=True
+        model_sd = _build_model(endog, order, seasonal_order, simple_diff=True)
+        res = _fit_robust(model_sd, maxiter=maxiter, stage='coarse')
+    if res is None:
         return None
-
+    aic = res.aic
+    if np.isnan(aic) or np.isinf(aic):
+        return None
+    return {
+        'p': order[0], 'd': order[1], 'q': order[2],
+        'P': seasonal_order[0], 'D': seasonal_order[1], 'Q': seasonal_order[2], 's': seasonal_order[3],
+        'AIC': aic
+    }
 
 def optimize_sarimax_parallel(endog, param_grid, n_jobs=-1, maxiter=200):
     tasks = [((p, d_, q), (P, D_, Q, s_)) for (p, d_, q, P, D_, Q, s_) in param_grid]
     print(f'使用 CPU 并行搜索，n_jobs={n_jobs} (可通过环境变量 SARIMAX_N_JOBS 覆盖)')
+    # 进度条按任务数显示
     results = Parallel(n_jobs=n_jobs, backend='loky')(
-        delayed(_fit_one)(endog, order, seasonal, maxiter) for order, seasonal in tasks
+        delayed(_fit_one)(endog, order, seasonal, maxiter) for order, seasonal in tqdm(tasks, desc='并行拟合', ncols=80)
     )
     results = [r for r in results if r is not None]
     if not results:
         return pd.DataFrame(columns=['p','d','q','P','D','Q','s','AIC'])
     return pd.DataFrame(results).sort_values('AIC').reset_index(drop=True)
 
+# -----------------------------------------------
+# 搜索 + 最终拟合
+# -----------------------------------------------
 TEST_STEPS = 100
 train = data.iloc[:-TEST_STEPS]
 
 print('开始参数搜索...')
 N_JOBS = _get_n_jobs()
-best_df = optimize_sarimax_parallel(train['VALUE'], param_grid, n_jobs=N_JOBS)
+best_df = optimize_sarimax_parallel(train['VALUE'], param_grid, n_jobs=N_JOBS, maxiter=150)  # 稍降迭代以提速粗筛
 print('搜索完成，前 5 个最优结果:')
 print(best_df.head())
 
 if best_df.empty:
-    raise RuntimeError('参数搜索失败，没有可用的模型。')
+    raise RuntimeError('参数搜索失败，没有可用的模型（可能全部未收敛或出错）。')
 
 best_params = best_df.iloc[0]
 print('最优参数:')
@@ -183,21 +222,21 @@ final_order = (int(best_params.p), int(best_params.d), int(best_params.q))
 final_seasonal = (int(best_params.P), int(best_params.D), int(best_params.Q), int(best_params.s))
 print(f'最终使用 order={final_order}, seasonal_order={final_seasonal}')
 
-final_model = SARIMAX(
-    data['VALUE'],
-    order=final_order,
-    seasonal_order=final_seasonal,
-    enforce_stationarity=True,
-    enforce_invertibility=True,
-)
-with warnings.catch_warnings():
-    warnings.filterwarnings('ignore', message='Non-stationary starting seasonal autoregressive', category=UserWarning)
-    warnings.filterwarnings('ignore', message='Non-invertible starting seasonal moving average', category=UserWarning)
-    warnings.filterwarnings('ignore', message='Non-stationary starting autoregressive parameters', category=UserWarning)
-    final_result = final_model.fit(disp=False, maxiter=500)
-print(final_result.summary())
+# 最终模型：使用更稳健的回退链 + 更高 maxiter
+final_model = _build_model(data['VALUE'], final_order, final_seasonal, simple_diff=False)
+final_res = _fit_robust(final_model, maxiter=500, stage='fine')
+if final_res is None and (final_order[1] > 0 or final_seasonal[1] > 0):
+    final_model_sd = _build_model(data['VALUE'], final_order, final_seasonal, simple_diff=True)
+    final_res = _fit_robust(final_model_sd, maxiter=600, stage='fine')
+if final_res is None:
+    raise RuntimeError('最终模型多优化器尝试仍未收敛，请缩小搜索空间或调整差分/季节参数。')
 
-forecast = final_result.get_forecast(steps=TEST_STEPS)
+print(final_res.summary())
+
+# -----------------------------------------------
+# 预测评估
+# -----------------------------------------------
+forecast = final_res.get_forecast(steps=TEST_STEPS)
 forecast_mean = forecast.predicted_mean
 forecast_ci = forecast.conf_int(alpha=0.05)
 actual_test = data['VALUE'].iloc[-TEST_STEPS:]
@@ -205,6 +244,9 @@ actual_test = data['VALUE'].iloc[-TEST_STEPS:]
 mse = mean_squared_error(actual_test, forecast_mean)
 print(f'测试集 {TEST_STEPS} 步预测 MSE: {mse:.4f}')
 
+# -----------------------------------------------
+# 可视化
+# -----------------------------------------------
 plt.figure(figsize=(12,4))
 plt.plot(data['VALUE'], label='原始序列')
 plt.title('原始时间序列')
@@ -235,7 +277,7 @@ except Exception as e:
 
 plt.figure(figsize=(12,4))
 plt.plot(data['VALUE'], label='实际')
-plt.plot(final_result.fittedvalues, label='拟合', alpha=0.7)
+plt.plot(final_res.fittedvalues, label='拟合', alpha=0.7)
 plt.title('拟合值 vs 实际值')
 plt.legend()
 plt.tight_layout()
@@ -250,7 +292,7 @@ plt.legend()
 plt.tight_layout()
 
 try:
-    final_result.plot_diagnostics(figsize=(12,8))
+    final_res.plot_diagnostics(figsize=(12,8))
     plt.suptitle('残差诊断图')
     plt.tight_layout()
 except Exception as e:
@@ -261,7 +303,7 @@ plt.show()
 print('===== 模型选择与结果小结 =====')
 print(f'最优非季节参数 (p,d,q): {final_order}')
 print(f'最优季节参数 (P,D,Q,s): {final_seasonal}')
-print(f'最优模型 AIC: {best_df.iloc[0].AIC:.2f}')
+print(f'最优模型 AIC: {best_params.AIC:.2f}')
 print(f'测试集 MSE: {mse:.4f}')
-print('数据是否适合 SARIMAX: 已满足时间索引、频率稳定、缺失处理。')
-print('如需进一步提升，可尝试加入外生变量 (exog) 或扩大参数搜索空间。
+print('并发设置 n_jobs={}，BLAS 线程固定为 1；未收敛模型已自动剔除。'.format(_get_n_jobs()))
+print('若仍有收敛困难：尝试缩小 p/q/P/Q，或仅保留 s=[60]，或开启 simple_differencing（已在回退链中自动尝试）。')
