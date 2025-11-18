@@ -224,14 +224,43 @@ def _make_local_grid(base_rows, p_max, q_max, P_max, Q_max):
 def parallel_search(endog, grid, n_jobs, maxiter, stage_desc, stage_key):
     tasks = [((p, d_, q), (P, D_, Q, s_)) for (p, d_, q, P, D_, Q, s_) in grid]
     print(f'{stage_desc}：任务数={len(tasks)}, n_jobs={n_jobs}, maxiter={maxiter}')
-    results = Parallel(n_jobs=n_jobs, backend='loky')(
-        delayed(_fit_one_stage)(endog, order, seasonal, maxiter, stage=stage_key)
-        for order, seasonal in tqdm(tasks, desc=stage_desc, ncols=80)
-    )
-    results = [r for r in results if r is not None]
-    if not results:
+    
+    # 创建进度条，显示更详细的信息
+    best_aic = float('inf')
+    all_results = []
+    
+    # 分批处理以更新进度条
+    batch_size = max(8, len(tasks) // 15)  # 分成约15批
+    
+    with tqdm(total=len(tasks), desc=stage_desc, ncols=100, unit="模型") as pbar:
+        for i in range(0, len(tasks), batch_size):
+            batch_tasks = tasks[i:i+batch_size]
+            try:
+                batch_results = Parallel(n_jobs=n_jobs, backend='loky', timeout=300)(
+                    delayed(_fit_one_stage)(endog, order, seasonal, maxiter, stage=stage_key)
+                    for order, seasonal in batch_tasks
+                )
+                
+                # 过滤有效结果并更新最优AIC
+                valid_batch = [r for r in batch_results if r is not None]
+                all_results.extend(valid_batch)
+                
+                if valid_batch:
+                    batch_best = min(r['AIC'] for r in valid_batch)
+                    if batch_best < best_aic:
+                        best_aic = batch_best
+                
+                # 更新进度条
+                pbar.set_postfix_str(f"最优AIC: {best_aic:.2f}" if best_aic != float('inf') else "最优AIC: N/A")
+                pbar.update(len(batch_tasks))
+            except Exception as e:
+                # 如果批次失败，仍然更新进度条
+                print(f"\n警告: 批次 {i}-{i+len(batch_tasks)} 处理失败: {e}")
+                pbar.update(len(batch_tasks))
+    
+    if not all_results:
         return pd.DataFrame(columns=['p','d','q','P','D','Q','s','AIC'])
-    return pd.DataFrame(results).sort_values('AIC').reset_index(drop=True)
+    return pd.DataFrame(all_results).sort_values('AIC').reset_index(drop=True)
 
 # -----------------------------------------------
 # 两阶段搜索
