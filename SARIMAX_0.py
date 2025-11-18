@@ -10,18 +10,9 @@
 #   --top-k          / TOP_K          (默认 10)
 #   --small-gap      / SMALL_GAP      (默认 0.5)
 #   --no-fine-expand（可选）关闭精调局部扩展
-#
-# 例子（PowerShell）：
-#   python SARIMAX_0.py --coarse-maxiter 60 --fine-maxiter 400 --top-k 12 --small-gap 0.3
-#
-# 也可用环境变量（命令行参数优先覆盖环境变量）：
-#   $env:COARSE_MAXITER="60"; $env:FINE_MAXITER="400"; $env:TOP_K="12"; $env:SMALL_GAP="0.3"
-#
-# 其它说明：
-# - 维持并发与 BLAS 线程限制：SARIMAX_N_JOBS 控制并发；若未设置 OMP/MKL/NUMEXPR 线程，默认设为 1。
-# - 两阶段搜索：粗筛（低 maxiter）→ 精调（高 maxiter），并可根据 small-gap 判断是否跳过精调。
-# - 鲁棒拟合：多优化器回退链 + simple_differencing 回退，未收敛模型不参与 AIC 排序。
-# - 屏蔽起始参数相关的告警，不影响最终拟合。
+# - 两阶段搜索：粗筛（低 maxiter）→ 精调（高 maxiter），根据 small-gap 判定是否跳过精调。
+# - 鲁棒拟合：多优化器回退链 + simple_differencing 回退，未收敛模型剔除。
+# - 屏蔽起始参数告警 + 屏蔽 ConvergenceWarning（仅显示最终筛选后的结果）。
 # ===============================================
 
 import warnings
@@ -44,6 +35,10 @@ from sklearn.metrics import mean_squared_error
 from tqdm import tqdm
 from joblib import Parallel, delayed
 
+# 屏蔽收敛告警（在剔除未收敛模型逻辑下安全）
+from statsmodels.tools.sm_exceptions import ConvergenceWarning
+warnings.filterwarnings('ignore', category=ConvergenceWarning)
+
 # ---------------- 参数解析与默认 ----------------
 def _env_int(name, default):
     try:
@@ -59,7 +54,7 @@ def _env_float(name, default):
 
 def _get_n_jobs():
     try:
-        return int(os.environ.get('SARIMAX_N_JOBS', '-1'))  # -1 表示全部核心
+        return int(os.environ.get('SARIMAX_N_JOBS', '-1'))
     except Exception:
         return -1
 
@@ -84,16 +79,15 @@ TOP_K          = args.top_k
 SMALL_GAP      = args.small_gap
 FINE_EXPAND    = not args.no_fine_expand
 
-# 控制/展示设置
 print(f"[参数] COARSE_MAXITER={COARSE_MAXITER}, FINE_MAXITER={FINE_MAXITER}, TOP_K={TOP_K}, SMALL_GAP={SMALL_GAP}, FINE_EXPAND={FINE_EXPAND}")
 
-# 字体与样式
 plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False
 sns.set_style("whitegrid")
+plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Microsoft YaHei']
 
 # -----------------------------------------------
-# 读取数据并检查是否适用于 SARIMAX
+# 数据读取与预处理
 # -----------------------------------------------
 raw = pd.read_csv('data.csv')
 if 'timestamp' in raw.columns:
@@ -104,7 +98,7 @@ else:
     raw = raw.set_index(raw.columns[0])
 
 raw = raw.sort_index()
-raw = raw.asfreq('T')  # 等价于 'min'
+raw = raw.asfreq('T')
 
 missing_count = raw['VALUE'].isna().sum()
 if missing_count > 0:
@@ -119,17 +113,16 @@ if raw.index.duplicated().any():
 print('数据起止时间:', raw.index.min(), '->', raw.index.max())
 print('总样本数:', len(raw))
 print('是否存在缺失:', raw['VALUE'].isna().any())
-
 if len(raw) < 500:
     print('样本少于 500，建议谨慎选择较大的季节长度。')
 
 data = raw.copy()
 
 # -----------------------------------------------
-# 平稳性检验 (ADF) & 差分
+# 平稳性检验
 # -----------------------------------------------
-adf_stat, adf_p, _, _, critical_values, _ = adfuller(data['VALUE'])
-print(f'原始序列 ADF Statistic: {adf_stat:.4f}, p-value: {adf_p:.50f}')
+adf_stat, adf_p, *_ = adfuller(data['VALUE'])
+print(f'原始序列 ADF Statistic: {adf_stat:.4f}, p-value: {adf_p:.6g}')
 if adf_p < 0.05:
     d = 0
     print('原始序列已平稳，d=0')
@@ -140,49 +133,43 @@ else:
 
 if d == 1:
     diff_adf_stat, diff_adf_p, *_ = adfuller(data['VALUE'].dropna().diff().dropna())
-    print(f'差分后 ADF Statistic: {diff_adf_stat:.4f}, p-value: {diff_adf_p:.50f}')
+    print(f'差分后 ADF Statistic: {diff_adf_stat:.4f}, p-value: {diff_adf_p:.6g}')
 
 # -----------------------------------------------
-# 搜索空间设置
+# 搜索空间
 # -----------------------------------------------
 p_range = range(0, 3)
 q_range = range(0, 3)
-s_candidates = [60, 120] if len(data) >= 120 else [60]
+s_candidates = [s for s in ([60, 120] if len(data) >= 120 else [60]) if len(data) >= 3*s]
+if not s_candidates:
+    s_candidates = [60]
+print(f'季节候选周期: {s_candidates}')
+
 P_range = range(0, 2)
 Q_range = range(0, 2)
 D_values = [0, 1]
 
-print(f'季节候选周期: {s_candidates}')
-
-param_grid = []
-for p in p_range:
-    for q in q_range:
-        for P in P_range:
-            for Q in Q_range:
-                for D_ in D_values:
-                    for s_ in s_candidates:
-                        param_grid.append((p, d, q, P, D_, Q, s_))
-
+param_grid = [(p, d, q, P, D_, Q, s_) for p in p_range for q in q_range
+              for P in P_range for Q in Q_range for D_ in D_values for s_ in s_candidates]
 print(f'总参数组合数: {len(param_grid)}')
 
 # -----------------------------------------------
-# 稳健拟合：优化器回退 + 可选 simple_differencing
+# 拟合相关函数
 # -----------------------------------------------
 def _fit_robust(model, maxiter=200, stage='coarse'):
     methods_coarse = ['lbfgs', 'powell']
     methods_fine = ['lbfgs', 'powell', 'nm', 'bfgs', 'cg']
     methods = methods_coarse if stage == 'coarse' else methods_fine
-
     for m in methods:
         try:
             with warnings.catch_warnings():
-                # 屏蔽与起始参数相关的告警
+                warnings.filterwarnings('ignore', category=ConvergenceWarning)
                 warnings.filterwarnings('ignore', message='Non-stationary starting seasonal autoregressive', category=UserWarning)
                 warnings.filterwarnings('ignore', message='Non-invertible starting seasonal moving average', category=UserWarning)
                 warnings.filterwarnings('ignore', message='Non-stationary starting autoregressive parameters', category=UserWarning)
+                # ConvergenceWarning 已在全局屏蔽
                 res = model.fit(method=m, disp=False, maxiter=maxiter)
-            converged = bool(res.mle_retvals.get('converged', True))
-            if converged and np.isfinite(res.aic):
+            if bool(res.mle_retvals.get('converged', True)) and np.isfinite(res.aic):
                 return res
         except Exception:
             continue
@@ -234,9 +221,6 @@ def _make_local_grid(base_rows, p_max, q_max, P_max, Q_max):
                         local.add((p_new, d0, q_new, P_new, D0, Q_new, s0))
     return list(local)
 
-# -----------------------------------------------
-# 并行搜索（带进度条）
-# -----------------------------------------------
 def parallel_search(endog, grid, n_jobs, maxiter, stage_desc, stage_key):
     tasks = [((p, d_, q), (P, D_, Q, s_)) for (p, d_, q, P, D_, Q, s_) in grid]
     print(f'{stage_desc}：任务数={len(tasks)}, n_jobs={n_jobs}, maxiter={maxiter}')
@@ -250,39 +234,34 @@ def parallel_search(endog, grid, n_jobs, maxiter, stage_desc, stage_key):
     return pd.DataFrame(results).sort_values('AIC').reset_index(drop=True)
 
 # -----------------------------------------------
-# 两阶段搜索 + 最终拟合
+# 两阶段搜索
 # -----------------------------------------------
 TEST_STEPS = 100
 train = data.iloc[:-TEST_STEPS]
 N_JOBS = _get_n_jobs()
 
-# 粗筛
 print('开始粗筛参数搜索...')
 coarse_df = parallel_search(train['VALUE'], param_grid, N_JOBS, COARSE_MAXITER, '并行拟合(粗筛)', 'coarse')
 print('粗筛完成，前 10 个结果:')
 print(coarse_df.head(min(10, len(coarse_df))))
-
 if coarse_df.empty:
-    raise RuntimeError('粗筛阶段没有可用模型（可能全部未收敛或出错）。')
+    raise RuntimeError('粗筛阶段没有可用模型。')
 
-# 是否需要精调
 need_fine = True
 if len(coarse_df) >= TOP_K:
     gap = coarse_df.iloc[TOP_K-1].AIC - coarse_df.iloc[0].AIC
     print(f'粗筛第1与第{TOP_K}模型 AIC 差: {gap:.4f}')
     if gap < SMALL_GAP:
-        print('AIC 差距很小，跳过精调阶段，直接使用最优粗筛模型。')
+        print('AIC 差距很小，跳过精调阶段。')
         need_fine = False
 else:
-    print(f'粗筛可用模型不足 TOP_K={TOP_K}，按现有最优结果继续。')
+    print(f'可用模型不足 TOP_K={TOP_K}，跳过精调。')
     need_fine = False
 
-# 精调局部扩展
 fine_df = None
 if need_fine and FINE_EXPAND:
     base_top = coarse_df.head(TOP_K)
     local_grid = _make_local_grid(base_top, max(p_range), max(q_range), max(P_range), max(Q_range))
-    # 保证局部网格均在原始候选空间中（s 值、d、D 等一致）
     coarse_set = set(param_grid)
     local_grid = [g for g in local_grid if g in coarse_set]
     print(f'精调局部网格大小: {len(local_grid)}')
@@ -295,7 +274,6 @@ if need_fine and FINE_EXPAND:
         print('局部扩展网格为空，跳过精调。')
         need_fine = False
 
-# 选择最终模型
 if need_fine and fine_df is not None and not fine_df.empty:
     best_all = pd.concat([coarse_df.head(TOP_K), fine_df], ignore_index=True).sort_values('AIC').reset_index(drop=True)
     final_row = best_all.iloc[0]
@@ -305,12 +283,13 @@ else:
     print('最终最优参数来自粗筛结果（或跳过精调）。')
 
 print(final_row)
-
 final_order = (int(final_row.p), int(final_row.d), int(final_row.q))
 final_seasonal = (int(final_row.P), int(final_row.D), int(final_row.Q), int(final_row.s))
 print(f'最终使用 order={final_order}, seasonal_order={final_seasonal}')
 
-# 最终模型拟合（更强回退链）
+# -----------------------------------------------
+# 最终模型拟合
+# -----------------------------------------------
 final_model = _build_model(data['VALUE'], final_order, final_seasonal, simple_diff=False)
 final_res = _fit_robust(final_model, maxiter=max(COARSE_MAXITER, FINE_MAXITER, 500), stage='fine')
 if final_res is None and (final_order[1] > 0 or final_seasonal[1] > 0):
@@ -328,7 +307,6 @@ forecast = final_res.get_forecast(steps=TEST_STEPS)
 forecast_mean = forecast.predicted_mean
 forecast_ci = forecast.conf_int(alpha=0.05)
 actual_test = data['VALUE'].iloc[-TEST_STEPS:]
-
 mse = mean_squared_error(actual_test, forecast_mean)
 print(f'测试集 {TEST_STEPS} 步预测 MSE: {mse:.4f}')
 
@@ -358,7 +336,7 @@ plt.tight_layout()
 try:
     decomp = seasonal_decompose(data['VALUE'], period=final_seasonal[3], model='additive', extrapolate_trend='freq')
     decomp.plot()
-    plt.suptitle('季节分解 (period={})'.format(final_seasonal[3]))
+    plt.suptitle(f'季节分解 (period={final_seasonal[3]})')
     plt.tight_layout()
 except Exception as e:
     print('季节分解失败:', e)
@@ -396,4 +374,4 @@ print(f'测试集 MSE: {mse:.4f}')
 print('两阶段配置: COARSE_MAXITER={} FINE_MAXITER={} TOP_K={} SMALL_GAP={} FINE_EXPAND={}'.format(
     COARSE_MAXITER, FINE_MAXITER, TOP_K, SMALL_GAP, FINE_EXPAND))
 print('并发设置 n_jobs={}，BLAS 线程固定为 1；未收敛模型已自动剔除。'.format(_get_n_jobs()))
-print('如需进一步提升，可减少搜索空间、或加入外生变量 (exog)。')
+print('已屏蔽 ConvergenceWarning；若需诊断具体未收敛原因，可临时注释该过滤行。')
