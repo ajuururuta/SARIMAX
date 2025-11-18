@@ -22,6 +22,7 @@ import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import seaborn as sns
 
 # 统计 / 时序库
 from statsmodels.tsa.statespace.sarimax import SARIMAX
@@ -44,6 +45,12 @@ def _get_n_jobs():
         return int(os.environ.get('SARIMAX_N_JOBS', '-1'))  # -1 表示使用全部核心
     except Exception:
         return -1
+
+# 设置中文字体和图形样式
+plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Microsoft YaHei']  # 用来正常显示中文标签
+plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
+sns.set_style("whitegrid")
+plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Microsoft YaHei']
 
 # -----------------------------------------------
 # 读取数据并检查是否适用于 SARIMAX
