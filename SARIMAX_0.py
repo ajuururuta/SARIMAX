@@ -11,7 +11,7 @@
 # 5. 增加：原始序列图、差分图、ACF/PACF、季节分解、残差诊断、拟合 vs 实际、预测图。  
 # 6. 数据质量检查：缺失、重复索引、频率设置。  
 # 7. 新增：CPU 并行网格搜索 (joblib)，通过环境变量 SARIMAX_N_JOBS 控制并发数，默认使用全部核心。  
-# 8. 新增：在拟合调用处屏蔽特定 UserWarning（Non-stationary starting seasonal autoregressive）。
+# 8. 新增：在拟合调用处屏蔽特定 UserWarning（Non-stationary starting seasonal autoregressive / Non-invertible starting seasonal moving average）。
 # ===============================================
 
 import warnings
@@ -126,7 +126,7 @@ P_range = range(0, 2)
 Q_range = range(0, 2)
 D_values = [0, 1]  # 同时尝试是否做季节性差分
 
-print(f'季节候选周期: {s_candidates}')
+print(f'季节候选周期: {s_candidates}') 
 
 # 构建所有参数组合
 param_grid = []
@@ -153,11 +153,16 @@ def _fit_one(endog, order, seasonal_order, maxiter=200):
             enforce_stationarity=True,
             enforce_invertibility=True,
         )
-        # 静默“Non-stationary starting seasonal autoregressive”起始参数告警
+        # 静默起始参数相关的特定告警
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 'ignore',
                 message='Non-stationary starting seasonal autoregressive',
+                category=UserWarning
+            )
+            warnings.filterwarnings(
+                'ignore',
+                message='Non-invertible starting seasonal moving average',
                 category=UserWarning
             )
             fitted = model.fit(disp=False, maxiter=maxiter)
@@ -207,7 +212,7 @@ final_seasonal = (int(best_params.P), int(best_params.D), int(best_params.Q), in
 print(f'最终使用 order={final_order}, seasonal_order={final_seasonal}')
 
 # -----------------------------------------------
-# 拟合最终模型（同样静默该告警）
+# 拟合最终模型（同样静默该类告警）
 # -----------------------------------------------
 final_model = SARIMAX(
     data['VALUE'],
@@ -222,6 +227,11 @@ with warnings.catch_warnings():
         message='Non-stationary starting seasonal autoregressive',
         category=UserWarning
     )
+    warnings.filterwarnings(
+        'ignore',
+        message='Non-invertible starting seasonal moving average',
+        category=UserWarning
+    )
     final_result = final_model.fit(disp=False, maxiter=500)
 print(final_result.summary())
 
@@ -231,8 +241,7 @@ print(final_result.summary())
 forecast = final_result.get_forecast(steps=TEST_STEPS)
 forecast_mean = forecast.predicted_mean
 forecast_ci = forecast.conf_int(alpha=0.05)
-actual_test = data['VALUE'].iloc[-TEST_STEPS:]
-
+actual_test = data['VALUE'].iloc[-TEST_STEPS:] 
 mse = mean_squared_error(actual_test, forecast_mean)
 print(f'测试集 {TEST_STEPS} 步预测 MSE: {mse:.4f}')
 
