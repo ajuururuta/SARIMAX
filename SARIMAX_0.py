@@ -7,10 +7,11 @@
 # 1. 使用 tqdm 终端进度条 (替换 tqdm_notebook)。
 # 2. 自动根据 ADF 检验选择 d。
 # 3. 支持候选季节周期，自动搜索最优 (AIC 最小)。
-# 4. 自动挑选 AIC 最小的模型并输出详细 summary。
-# 5. 增加：原始序列图、差分图、ACF/PACF、季节分解、残差诊断、拟合 vs 实际、预测图。
-# 6. 数据质量检查：缺失、重复索引、频率设置。
-# 7. 新增：CPU 并行网格搜索 (joblib)，通过环境变量 SARIMAX_N_JOBS 控制并发数，默认使用全部核心。
+# 4. 自动挑选 AIC 最小的模型并输出详细 summary。  
+# 5. 增加：原始序列图、差分图、ACF/PACF、季节分解、残差诊断、拟合 vs 实际、预测图。  
+# 6. 数据质量检查：缺失、重复索引、频率设置。  
+# 7. 新增：CPU 并行网格搜索 (joblib)，通过环境变量 SARIMAX_N_JOBS 控制并发数，默认使用全部核心。  
+# 8. 新增：在拟合调用处屏蔽特定 UserWarning（Non-stationary starting seasonal autoregressive）。
 # ===============================================
 
 import warnings
@@ -145,8 +146,21 @@ print(f'总参数组合数: {len(param_grid)}')
 
 def _fit_one(endog, order, seasonal_order, maxiter=200):
     try:
-        model = SARIMAX(endog, order=order, seasonal_order=seasonal_order)
-        fitted = model.fit(disp=False, maxiter=maxiter)
+        model = SARIMAX(
+            endog,
+            order=order,
+            seasonal_order=seasonal_order,
+            enforce_stationarity=True,
+            enforce_invertibility=True,
+        )
+        # 静默“Non-stationary starting seasonal autoregressive”起始参数告警
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                'ignore',
+                message='Non-stationary starting seasonal autoregressive',
+                category=UserWarning
+            )
+            fitted = model.fit(disp=False, maxiter=maxiter)
         return {
             'p': order[0], 'd': order[1], 'q': order[2],
             'P': seasonal_order[0], 'D': seasonal_order[1], 'Q': seasonal_order[2], 's': seasonal_order[3],
@@ -193,10 +207,22 @@ final_seasonal = (int(best_params.P), int(best_params.D), int(best_params.Q), in
 print(f'最终使用 order={final_order}, seasonal_order={final_seasonal}')
 
 # -----------------------------------------------
-# 拟合最终模型
+# 拟合最终模型（同样静默该告警）
 # -----------------------------------------------
-final_model = SARIMAX(data['VALUE'], order=final_order, seasonal_order=final_seasonal)
-final_result = final_model.fit(disp=False, maxiter=500)
+final_model = SARIMAX(
+    data['VALUE'],
+    order=final_order,
+    seasonal_order=final_seasonal,
+    enforce_stationarity=True,
+    enforce_invertibility=True,
+)
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        'ignore',
+        message='Non-stationary starting seasonal autoregressive',
+        category=UserWarning
+    )
+    final_result = final_model.fit(disp=False, maxiter=500)
 print(final_result.summary())
 
 # -----------------------------------------------
