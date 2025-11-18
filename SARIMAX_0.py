@@ -112,7 +112,7 @@ parser.add_argument("--small-gap",      type=float, default=_env_float("SMALL_GA
 parser.add_argument("--no-fine-expand", action="store_true", help="禁用精调阶段的局部扩展网格")
 parser.add_argument("--quick-mode",     action="store_true", help="快速模式：减少搜索空间")
 parser.add_argument("--early-stop",     type=int, default=5, help="早停：连续 N 个批次无改善则停止，默认 5，0 为禁用")
-parser.add_argument("--task-timeout",   type=int, default=60, help="单个任务超时秒数，默认 60")
+
 parser.add_argument("--resume",         action="store_true", help="从上次中断处恢复")
 parser.add_argument("--backend",        type=str, default="threading", choices=["loky", "threading", "multiprocessing"], help="并行后端，默认 threading（更快启动）")
 args, _ = parser.parse_known_args()
@@ -124,7 +124,6 @@ SMALL_GAP      = args.small_gap
 FINE_EXPAND    = not args.no_fine_expand
 QUICK_MODE     = args.quick_mode
 EARLY_STOP_BATCHES = args.early_stop
-TASK_TIMEOUT   = args.task_timeout
 RESUME         = args.resume
 BACKEND        = args.backend
 
@@ -134,7 +133,8 @@ print("="*60)
 gpu_info = check_gpu_available()
 print(f"[参数] COARSE_MAXITER={COARSE_MAXITER}, FINE_MAXITER={FINE_MAXITER}")
 print(f"[参数] TOP_K={TOP_K}, SMALL_GAP={SMALL_GAP}, FINE_EXPAND={FINE_EXPAND}")
-print(f"[参数] QUICK_MODE={QUICK_MODE}, EARLY_STOP={EARLY_STOP_BATCHES}, TASK_TIMEOUT={TASK_TIMEOUT}s")
+print(f"[参数] QUICK_MODE={QUICK_MODE}, EARLY_STOP={EARLY_STOP_BATCHES}")
+print(f"[参数] 无超时限制 - 确保每个模型完整拟合")
 print(f"[参数] BACKEND={BACKEND}, N_JOBS={_get_n_jobs()}")
 print("="*60)
 
@@ -206,70 +206,99 @@ param_grid = [(p, d, q, P, D_, Q, s_) for p in p_range for q in q_range
               for P in P_range for Q in Q_range for D_ in D_values for s_ in s_candidates]
 print(f'  总参数组合: {len(param_grid)}')
 
-# ============== 拟合函数（带超时） ============== 
-def _fit_robust_with_timeout(model, maxiter=200, stage='coarse', timeout=30):
-    """带超时控制的鲁棒拟合"""
-    import signal
+# ============== 拟合函数（无超时，增强优化器） ============== 
+def _fit_robust_no_timeout(model, maxiter=200, stage='coarse'):
+    """鲁棒拟合，无超时限制，增强优化器列表"""
     
-    def timeout_handler(signum, frame):
-        raise TimeoutError("Model fitting timeout")
-    
-    methods_coarse = ['lbfgs', 'powell']
-    methods_fine = ['lbfgs', 'powell', 'nm']
+    methods_coarse = ['lbfgs', 'powell', 'bfgs']
+    methods_fine = ['lbfgs', 'powell', 'nm', 'bfgs', 'cg']
     methods = methods_coarse if stage == 'coarse' else methods_fine
     
-    for m in methods:
+    for idx, m in enumerate(methods):
         try:
-            # 设置超时（仅在 Unix 系统上）
-            if hasattr(signal, 'SIGALRM'):
-                signal.signal(signal.SIGALRM, timeout_handler)
-                signal.alarm(timeout)
+            # 后续优化器使用 2 倍迭代次数
+            current_maxiter = maxiter * 2 if idx > 0 else maxiter
             
             with warnings.catch_warnings():
                 warnings.filterwarnings('ignore')
-                res = model.fit(method=m, disp=False, maxiter=maxiter)
-            
-            if hasattr(signal, 'SIGALRM'):
-                signal.alarm(0)  # 取消超时
+                res = model.fit(method=m, disp=False, maxiter=current_maxiter)
             
             if bool(res.mle_retvals.get('converged', True)) and np.isfinite(res.aic):
                 return res
-        except (TimeoutError, Exception):
-            if hasattr(signal, 'SIGALRM'):
-                signal.alarm(0)
+        except Exception:
             continue
     return None
 
 
 def _build_model(endog, order, seasonal_order, simple_diff=False):
-    return SARIMAX(
-        endog,
-        order=order,
-        seasonal_order=seasonal_order,
-        enforce_stationarity=True,
-        enforce_invertibility=True,
-        simple_differencing=simple_diff
-    )
-
-
-def _fit_one_stage(endog, order, seasonal_order, maxiter=200, stage='coarse', timeout=30):
-    """单个模型拟合（带重试和超时）"""
+    """构建 SARIMAX 模型，带异常处理和回退机制"""
     try:
-        model = _build_model(endog, order, seasonal_order, simple_diff=False)
-        res = _fit_robust_with_timeout(model, maxiter=maxiter, stage=stage, timeout=timeout)
-        
-        if res is None and (order[1] > 0 or seasonal_order[1] > 0):
-            model_sd = _build_model(endog, order, seasonal_order, simple_diff=True)
-            res = _fit_robust_with_timeout(model_sd, maxiter=maxiter, stage=stage, timeout=timeout)
-        
-        if res is None or not np.isfinite(res.aic):
+        return SARIMAX(
+            endog,
+            order=order,
+            seasonal_order=seasonal_order,
+            enforce_stationarity=True,
+            enforce_invertibility=True,
+            simple_differencing=simple_diff
+        )
+    except Exception:
+        # 失败时尝试放宽约束
+        try:
+            return SARIMAX(
+                endog,
+                order=order,
+                seasonal_order=seasonal_order,
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+                simple_differencing=simple_diff
+            )
+        except Exception:
             return None
+
+
+def _fit_one_stage(endog, order, seasonal_order, maxiter=200, stage='coarse'):
+    """单个模型拟合（三层回退机制 + KeyboardInterrupt 处理）"""
+    try:
+        # 第一层：标准拟合
+        model = _build_model(endog, order, seasonal_order, simple_diff=False)
+        if model is not None:
+            res = _fit_robust_no_timeout(model, maxiter=maxiter, stage=stage)
+            
+            if res is not None and np.isfinite(res.aic):
+                return {
+                    'p': order[0], 'd': order[1], 'q': order[2],
+                    'P': seasonal_order[0], 'D': seasonal_order[1], 'Q': seasonal_order[2], 's': seasonal_order[3],
+                    'AIC': float(res.aic)
+                }
         
-        return {
-            'p': order[0], 'd': order[1], 'q': order[2],
-            'P': seasonal_order[0], 'D': seasonal_order[1], 'Q': seasonal_order[2], 's': seasonal_order[3],
-            'AIC': float(res.aic)
-        }
+        # 第二层：simple_differencing 回退
+        if order[1] > 0 or seasonal_order[1] > 0:
+            model_sd = _build_model(endog, order, seasonal_order, simple_diff=True)
+            if model_sd is not None:
+                res = _fit_robust_no_timeout(model_sd, maxiter=maxiter, stage=stage)
+                
+                if res is not None and np.isfinite(res.aic):
+                    return {
+                        'p': order[0], 'd': order[1], 'q': order[2],
+                        'P': seasonal_order[0], 'D': seasonal_order[1], 'Q': seasonal_order[2], 's': seasonal_order[3],
+                        'AIC': float(res.aic)
+                    }
+        
+        # 第三层：3倍迭代重试
+        model_retry = _build_model(endog, order, seasonal_order, simple_diff=False)
+        if model_retry is not None:
+            res = _fit_robust_no_timeout(model_retry, maxiter=maxiter * 3, stage=stage)
+            
+            if res is not None and np.isfinite(res.aic):
+                return {
+                    'p': order[0], 'd': order[1], 'q': order[2],
+                    'P': seasonal_order[0], 'D': seasonal_order[1], 'Q': seasonal_order[2], 's': seasonal_order[3],
+                    'AIC': float(res.aic)
+                }
+        
+        return None
+    except KeyboardInterrupt:
+        raise  # 传递 KeyboardInterrupt 以便上层处理
     except Exception:
         return None
 
@@ -296,13 +325,14 @@ def _make_local_grid(base_rows, p_max, q_max, P_max, Q_max):
 
 # ============== 改进的并行搜索 ============== 
 def parallel_search_optimized(endog, grid, n_jobs, maxiter, stage_desc, stage_key, 
-                              early_stop_batches=5, task_timeout=30, resume_file=None):
-    """优化的并行搜索，支持早停和恢复"""
+                              early_stop_batches=5, resume_file=None):
+    """优化的并行搜索，支持早停和恢复，无超时限制"""
     
     tasks = [((p, d_, q), (P, D_, Q, s_)) for (p, d_, q, P, D_, Q, s_) in grid]
     print(f'\n{stage_desc}')
     print(f'  任务总数: {len(tasks)}, 并行度: {n_jobs}, maxiter: {maxiter}')
-    print(f'  早停批次: {early_stop_batches}, 任务超时: {task_timeout}s')
+    print(f'  早停批次: {early_stop_batches}')
+    print(f'  无超时限制 - 每个模型将完整拟合直到收敛或达到最大迭代次数')
     
     # 恢复之前的结果
     completed_tasks = set()
@@ -341,13 +371,13 @@ def parallel_search_optimized(endog, grid, n_jobs, maxiter, stage_desc, stage_ke
             batch_start = time.time()
             
             try:
-                # 使用指定的后端和更长的超时
+                # 使用指定的后端，无超时限制
                 batch_results = Parallel(
                     n_jobs=n_jobs, 
                     backend=BACKEND, 
-                    timeout=max(600, task_timeout * len(batch_tasks))
+                    timeout=None
                 )(
-                    delayed(_fit_one_stage)(endog, order, seasonal, maxiter, stage_key, task_timeout)
+                    delayed(_fit_one_stage)(endog, order, seasonal, maxiter, stage_key)
                     for order, seasonal in batch_tasks
                 )
                 
@@ -393,15 +423,38 @@ def parallel_search_optimized(endog, grid, n_jobs, maxiter, stage_desc, stage_ke
                     print(f'\n  ⚠ 早停触发：连续 {early_stop_batches} 个批次无显著改善')
                     break
                 
+            except KeyboardInterrupt:
+                print(f'\n  ⚠ 检测到 KeyboardInterrupt，保存进度...')
+                # 保存当前进度
+                completed_tasks.update(range(i, i + len(batch_tasks)))
+                if resume_file:
+                    with open(resume_file, 'wb') as f:
+                        pickle.dump({
+                            'results': all_results,
+                            'completed': completed_tasks
+                        }, f)
+                    print(f'  ✓ 进度已保存到 {resume_file}')
+                raise  # 重新抛出以便上层处理
             except Exception as e:
                 print(f'\n  ✗ 批次 {i}-{i+len(batch_tasks)} 失败: {str(e)[:100]}')
                 # 失败时尝试单个任务处理
-                for task in batch_tasks:
+                for task_idx, task in enumerate(batch_tasks):
                     try:
-                        single_result = _fit_one_stage(endog, task[0], task[1], maxiter, stage_key, task_timeout)
+                        single_result = _fit_one_stage(endog, task[0], task[1], maxiter, stage_key)
                         if single_result:
                             all_results.append(single_result)
-                    except:
+                    except KeyboardInterrupt:
+                        print(f'\n  ⚠ 单任务恢复时检测到 KeyboardInterrupt')
+                        # 保存进度
+                        completed_tasks.update(range(i, i + task_idx))
+                        if resume_file:
+                            with open(resume_file, 'wb') as f:
+                                pickle.dump({
+                                    'results': all_results,
+                                    'completed': completed_tasks
+                                }, f)
+                        raise
+                    except Exception:
                         pass
                 pbar.update(len(batch_tasks))
     
@@ -434,7 +487,6 @@ coarse_df = parallel_search_optimized(
     train['VALUE'], param_grid, N_JOBS, COARSE_MAXITER, 
     '粗筛搜索', 'coarse',
     early_stop_batches=EARLY_STOP_BATCHES,
-    task_timeout=TASK_TIMEOUT,
     resume_file=resume_coarse
 )
 
@@ -472,7 +524,6 @@ if need_fine and FINE_EXPAND:
             train['VALUE'], local_grid, N_JOBS, FINE_MAXITER,
             '精调搜索', 'fine',
             early_stop_batches=max(3, EARLY_STOP_BATCHES // 2),
-            task_timeout=TASK_TIMEOUT * 2,
             resume_file=resume_fine
         )
         print('\n  前 5 个精调结果:')
@@ -502,12 +553,16 @@ final_seasonal = (int(final_row.P), int(final_row.D), int(final_row.Q), int(fina
 # ============== 最终模型拟合 ============== 
 print('\n[5/6] 最终模型拟合...')
 final_model = _build_model(data['VALUE'], final_order, final_seasonal, simple_diff=False)
-final_res = _fit_robust_with_timeout(final_model, maxiter=max(500, FINE_MAXITER), stage='fine', timeout=120)
+if final_model is not None:
+    final_res = _fit_robust_no_timeout(final_model, maxiter=max(500, FINE_MAXITER), stage='fine')
+else:
+    final_res = None
 
 if final_res is None and (final_order[1] > 0 or final_seasonal[1] > 0):
     print('  尝试 simple_differencing 回退...')
     final_model_sd = _build_model(data['VALUE'], final_order, final_seasonal, simple_diff=True)
-    final_res = _fit_robust_with_timeout(final_model_sd, maxiter=600, stage='fine', timeout=180)
+    if final_model_sd is not None:
+        final_res = _fit_robust_no_timeout(final_model_sd, maxiter=600, stage='fine')
 
 if final_res is None:
     raise RuntimeError('最终模型拟合失败，请尝试调整参数或检查数据质量')
@@ -607,6 +662,7 @@ print(f'  QUICK_MODE={QUICK_MODE}')
 print(f'  EARLY_STOP={EARLY_STOP_BATCHES}')
 print(f'  BACKEND={BACKEND}')
 print(f'  N_JOBS={N_JOBS}')
+print(f'  无超时限制 - 所有模型完整拟合')
 print('='*60)
 
 if not gpu_info['cuda_available']:
