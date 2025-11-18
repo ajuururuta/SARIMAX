@@ -1,62 +1,96 @@
 # -*- coding: utf-8 -*-
 
 # ===============================================
-# SARIMAX 自动参数优化 + 可视化 + 终端进度条示例
+# SARIMAX 自动参数优化 + 可视化 + 两阶段并行搜索 + 可调参数
 # ===============================================
-# 改动说明：
-# 1. 使用 tqdm 终端进度条 (替换 tqdm_notebook)。
-# 2. 自动根据 ADF 检验选择 d。
-# 3. 支持候选季节周期，自动搜索最优 (AIC 最小)。
-# 4. 自动挑选 AIC 最小的模型并输出详细 summary.  
-# 5. 增加：原始序列图、差分图、ACF/PACF、季节分解、残差诊断、拟合 vs 实际、预测图。  
-# 6. 数据质量检查：缺失、重复索引、频率设置。  
-# 7. 新增：CPU 并行网格搜索 (joblib)，通过环境变量 SARIMAX_N_JOBS 控制并发数，默认使用全部核心。  
-# 8. 新增：在拟合调用处屏蔽特定 UserWarning（Non-stationary starting seasonal autoregressive / Non-invertible starting seasonal moving average / Non-stationary starting autoregressive parameters）。
-# 9. 新增：稳健拟合函数 + 优化器回退链；未收敛模型不参与 AIC 排序，减少 ConvergenceWarning。
+# 新增/增强点：
+# - 参数可调（命令行参数优先，环境变量次之，最后使用默认值）：
+#   --coarse-maxiter / COARSE_MAXITER (默认 50)
+#   --fine-maxiter   / FINE_MAXITER   (默认 300)
+#   --top-k          / TOP_K          (默认 10)
+#   --small-gap      / SMALL_GAP      (默认 0.5)
+#   --no-fine-expand（可选）关闭精调局部扩展
+#
+# 例子（PowerShell）：
+#   python SARIMAX_0.py --coarse-maxiter 60 --fine-maxiter 400 --top-k 12 --small-gap 0.3
+#
+# 也可用环境变量（命令行参数优先覆盖环境变量）：
+#   $env:COARSE_MAXITER="60"; $env:FINE_MAXITER="400"; $env:TOP_K="12"; $env:SMALL_GAP="0.3"
+#
+# 其它说明：
+# - 维持并发与 BLAS 线程限制：SARIMAX_N_JOBS 控制并发；若未设置 OMP/MKL/NUMEXPR 线程，默认设为 1。
+# - 两阶段搜索：粗筛（低 maxiter）→ 精调（高 maxiter），并可根据 small-gap 判断是否跳过精调。
+# - 鲁棒拟合：多优化器回退链 + simple_differencing 回退，未收敛模型不参与 AIC 排序。
+# - 屏蔽起始参数相关的告警，不影响最终拟合。
 # ===============================================
 
 import warnings
 warnings.filterwarnings('ignore')
 
-# 基础库
 import os
+import argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# 统计 / 时序库
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from statsmodels.tsa.seasonal import seasonal_decompose
 
-# 评估指标
 from sklearn.metrics import mean_squared_error
 
-# 进度条 (终端)
 from tqdm import tqdm
-
-# 并行库
 from joblib import Parallel, delayed
 
-# 控制并行度：优先读环境变量
+# ---------------- 参数解析与默认 ----------------
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except Exception:
+        return default
+
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except Exception:
+        return default
+
 def _get_n_jobs():
     try:
-        return int(os.environ.get('SARIMAX_N_JOBS', '-1'))  # -1 表示使用全部核心
+        return int(os.environ.get('SARIMAX_N_JOBS', '-1'))  # -1 表示全部核心
     except Exception:
         return -1
 
-# 为避免与 BLAS 抢线程，若用户未设置，则固定内部线程为 1
-for var in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"]:
-    if os.environ.get(var) is None:
-        os.environ[var] = "1"
+def _ensure_blas_single_thread():
+    for var in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"]:
+        if os.environ.get(var) is None:
+            os.environ[var] = "1"
 
-# 设置中文字体和图形样式
-plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Microsoft YaHei']  # 用来正常显示中文标签
-plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
-sns.set_style("whitegrid")
+_ensure_blas_single_thread()
+
+parser = argparse.ArgumentParser(description="SARIMAX 两阶段搜索（粗筛+精调）参数调节")
+parser.add_argument("--coarse-maxiter", type=int, default=_env_int("COARSE_MAXITER", 50), help="粗筛最大迭代次数，默认 50")
+parser.add_argument("--fine-maxiter",   type=int, default=_env_int("FINE_MAXITER", 300), help="精调最大迭代次数，默认 300")
+parser.add_argument("--top-k",          type=int, default=_env_int("TOP_K", 10),        help="粗筛保留的前 K 个模型，默认 10")
+parser.add_argument("--small-gap",      type=float, default=_env_float("SMALL_GAP", 0.5), help="AIC 差距阈值，小于则跳过精调，默认 0.5")
+parser.add_argument("--no-fine-expand", action="store_true", help="禁用精调阶段的局部扩展网格")
+args, _ = parser.parse_known_args()
+
+COARSE_MAXITER = args.coarse_maxiter
+FINE_MAXITER   = args.fine_maxiter
+TOP_K          = args.top_k
+SMALL_GAP      = args.small_gap
+FINE_EXPAND    = not args.no_fine_expand
+
+# 控制/展示设置
+print(f"[参数] COARSE_MAXITER={COARSE_MAXITER}, FINE_MAXITER={FINE_MAXITER}, TOP_K={TOP_K}, SMALL_GAP={SMALL_GAP}, FINE_EXPAND={FINE_EXPAND}")
+
+# 字体与样式
 plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Microsoft YaHei']
+plt.rcParams['axes.unicode_minus'] = False
+sns.set_style("whitegrid")
 
 # -----------------------------------------------
 # 读取数据并检查是否适用于 SARIMAX
@@ -109,7 +143,7 @@ if d == 1:
     print(f'差分后 ADF Statistic: {diff_adf_stat:.4f}, p-value: {diff_adf_p:.50f}')
 
 # -----------------------------------------------
-# 参数搜索空间设置
+# 搜索空间设置
 # -----------------------------------------------
 p_range = range(0, 3)
 q_range = range(0, 3)
@@ -132,10 +166,9 @@ for p in p_range:
 print(f'总参数组合数: {len(param_grid)}')
 
 # -----------------------------------------------
-# 稳健拟合函数：多优化器回退 + 可选 simple_differencing
+# 稳健拟合：优化器回退 + 可选 simple_differencing
 # -----------------------------------------------
 def _fit_robust(model, maxiter=200, stage='coarse'):
-    # stage: 'coarse' 使用较快回退；'fine' 使用更全方法
     methods_coarse = ['lbfgs', 'powell']
     methods_fine = ['lbfgs', 'powell', 'nm', 'bfgs', 'cg']
     methods = methods_coarse if stage == 'coarse' else methods_fine
@@ -143,7 +176,7 @@ def _fit_robust(model, maxiter=200, stage='coarse'):
     for m in methods:
         try:
             with warnings.catch_warnings():
-                # 屏蔽起始参数相关的特定告警（与最终收敛无关）
+                # 屏蔽与起始参数相关的告警
                 warnings.filterwarnings('ignore', message='Non-stationary starting seasonal autoregressive', category=UserWarning)
                 warnings.filterwarnings('ignore', message='Non-invertible starting seasonal moving average', category=UserWarning)
                 warnings.filterwarnings('ignore', message='Non-stationary starting autoregressive parameters', category=UserWarning)
@@ -165,34 +198,51 @@ def _build_model(endog, order, seasonal_order, simple_diff=False):
         simple_differencing=simple_diff
     )
 
-# -----------------------------------------------
-# 并行优化函数：遍历所有组合，返回 AIC 排序结果
-# -----------------------------------------------
-def _fit_one(endog, order, seasonal_order, maxiter=200):
-    # 优先用不做 simple_differencing 的模型
-    model = _build_model(endog, order, seasonal_order, simple_diff=False)
-    res = _fit_robust(model, maxiter=maxiter, stage='coarse')
-    if res is None and (order[1] > 0 or seasonal_order[1] > 0):
-        # 尝试 simple_differencing=True
-        model_sd = _build_model(endog, order, seasonal_order, simple_diff=True)
-        res = _fit_robust(model_sd, maxiter=maxiter, stage='coarse')
-    if res is None:
+def _fit_one_stage(endog, order, seasonal_order, maxiter=200, stage='coarse'):
+    try:
+        model = _build_model(endog, order, seasonal_order, simple_diff=False)
+        res = _fit_robust(model, maxiter=maxiter, stage=stage)
+        if res is None and (order[1] > 0 or seasonal_order[1] > 0):
+            model_sd = _build_model(endog, order, seasonal_order, simple_diff=True)
+            res = _fit_robust(model_sd, maxiter=maxiter, stage=stage)
+        if res is None or not np.isfinite(res.aic):
+            return None
+        return {
+            'p': order[0], 'd': order[1], 'q': order[2],
+            'P': seasonal_order[0], 'D': seasonal_order[1], 'Q': seasonal_order[2], 's': seasonal_order[3],
+            'AIC': float(res.aic)
+        }
+    except Exception:
         return None
-    aic = res.aic
-    if np.isnan(aic) or np.isinf(aic):
-        return None
-    return {
-        'p': order[0], 'd': order[1], 'q': order[2],
-        'P': seasonal_order[0], 'D': seasonal_order[1], 'Q': seasonal_order[2], 's': seasonal_order[3],
-        'AIC': aic
-    }
 
-def optimize_sarimax_parallel(endog, param_grid, n_jobs=-1, maxiter=200):
-    tasks = [((p, d_, q), (P, D_, Q, s_)) for (p, d_, q, P, D_, Q, s_) in param_grid]
-    print(f'使用 CPU 并行搜索，n_jobs={n_jobs} (可通过环境变量 SARIMAX_N_JOBS 覆盖)')
-    # 进度条按任务数显示
+def _clip(v, low, high):
+    return max(low, min(high, v))
+
+def _make_local_grid(base_rows, p_max, q_max, P_max, Q_max):
+    local = set()
+    for _, row in base_rows.iterrows():
+        p0, d0, q0 = int(row.p), int(row.d), int(row.q)
+        P0, D0, Q0, s0 = int(row.P), int(row.D), int(row.Q), int(row.s)
+        for dp in [-1, 0, 1]:
+            for dq in [-1, 0, 1]:
+                for dP in [-1, 0, 1]:
+                    for dQ in [-1, 0, 1]:
+                        p_new = _clip(p0 + dp, 0, p_max)
+                        q_new = _clip(q0 + dq, 0, q_max)
+                        P_new = _clip(P0 + dP, 0, P_max)
+                        Q_new = _clip(Q0 + dQ, 0, Q_max)
+                        local.add((p_new, d0, q_new, P_new, D0, Q_new, s0))
+    return list(local)
+
+# -----------------------------------------------
+# 并行搜索（带进度条）
+# -----------------------------------------------
+def parallel_search(endog, grid, n_jobs, maxiter, stage_desc, stage_key):
+    tasks = [((p, d_, q), (P, D_, Q, s_)) for (p, d_, q, P, D_, Q, s_) in grid]
+    print(f'{stage_desc}：任务数={len(tasks)}, n_jobs={n_jobs}, maxiter={maxiter}')
     results = Parallel(n_jobs=n_jobs, backend='loky')(
-        delayed(_fit_one)(endog, order, seasonal, maxiter) for order, seasonal in tqdm(tasks, desc='并行拟合', ncols=80)
+        delayed(_fit_one_stage)(endog, order, seasonal, maxiter, stage=stage_key)
+        for order, seasonal in tqdm(tasks, desc=stage_desc, ncols=80)
     )
     results = [r for r in results if r is not None]
     if not results:
@@ -200,34 +250,72 @@ def optimize_sarimax_parallel(endog, param_grid, n_jobs=-1, maxiter=200):
     return pd.DataFrame(results).sort_values('AIC').reset_index(drop=True)
 
 # -----------------------------------------------
-# 搜索 + 最终拟合
+# 两阶段搜索 + 最终拟合
 # -----------------------------------------------
 TEST_STEPS = 100
 train = data.iloc[:-TEST_STEPS]
-
-print('开始参数搜索...')
 N_JOBS = _get_n_jobs()
-best_df = optimize_sarimax_parallel(train['VALUE'], param_grid, n_jobs=N_JOBS, maxiter=150)  # 稍降迭代以提速粗筛
-print('搜索完成，前 5 个最优结果:')
-print(best_df.head())
 
-if best_df.empty:
-    raise RuntimeError('参数搜索失败，没有可用的模型（可能全部未收敛或出错）。')
+# 粗筛
+print('开始粗筛参数搜索...')
+coarse_df = parallel_search(train['VALUE'], param_grid, N_JOBS, COARSE_MAXITER, '并行拟合(粗筛)', 'coarse')
+print('粗筛完成，前 10 个结果:')
+print(coarse_df.head(min(10, len(coarse_df))))
 
-best_params = best_df.iloc[0]
-print('最优参数:')
-print(best_params)
+if coarse_df.empty:
+    raise RuntimeError('粗筛阶段没有可用模型（可能全部未收敛或出错）。')
 
-final_order = (int(best_params.p), int(best_params.d), int(best_params.q))
-final_seasonal = (int(best_params.P), int(best_params.D), int(best_params.Q), int(best_params.s))
+# 是否需要精调
+need_fine = True
+if len(coarse_df) >= TOP_K:
+    gap = coarse_df.iloc[TOP_K-1].AIC - coarse_df.iloc[0].AIC
+    print(f'粗筛第1与第{TOP_K}模型 AIC 差: {gap:.4f}')
+    if gap < SMALL_GAP:
+        print('AIC 差距很小，跳过精调阶段，直接使用最优粗筛模型。')
+        need_fine = False
+else:
+    print(f'粗筛可用模型不足 TOP_K={TOP_K}，按现有最优结果继续。')
+    need_fine = False
+
+# 精调局部扩展
+fine_df = None
+if need_fine and FINE_EXPAND:
+    base_top = coarse_df.head(TOP_K)
+    local_grid = _make_local_grid(base_top, max(p_range), max(q_range), max(P_range), max(Q_range))
+    # 保证局部网格均在原始候选空间中（s 值、d、D 等一致）
+    coarse_set = set(param_grid)
+    local_grid = [g for g in local_grid if g in coarse_set]
+    print(f'精调局部网格大小: {len(local_grid)}')
+    if local_grid:
+        print('开始精调参数搜索...')
+        fine_df = parallel_search(train['VALUE'], local_grid, N_JOBS, FINE_MAXITER, '并行拟合(精调)', 'fine')
+        print('精调完成，前 5 个结果:')
+        print(fine_df.head(min(5, len(fine_df))))
+    else:
+        print('局部扩展网格为空，跳过精调。')
+        need_fine = False
+
+# 选择最终模型
+if need_fine and fine_df is not None and not fine_df.empty:
+    best_all = pd.concat([coarse_df.head(TOP_K), fine_df], ignore_index=True).sort_values('AIC').reset_index(drop=True)
+    final_row = best_all.iloc[0]
+    print('最终最优参数来自精调合并结果:')
+else:
+    final_row = coarse_df.iloc[0]
+    print('最终最优参数来自粗筛结果（或跳过精调）。')
+
+print(final_row)
+
+final_order = (int(final_row.p), int(final_row.d), int(final_row.q))
+final_seasonal = (int(final_row.P), int(final_row.D), int(final_row.Q), int(final_row.s))
 print(f'最终使用 order={final_order}, seasonal_order={final_seasonal}')
 
-# 最终模型：使用更稳健的回退链 + 更高 maxiter
+# 最终模型拟合（更强回退链）
 final_model = _build_model(data['VALUE'], final_order, final_seasonal, simple_diff=False)
-final_res = _fit_robust(final_model, maxiter=500, stage='fine')
+final_res = _fit_robust(final_model, maxiter=max(COARSE_MAXITER, FINE_MAXITER, 500), stage='fine')
 if final_res is None and (final_order[1] > 0 or final_seasonal[1] > 0):
     final_model_sd = _build_model(data['VALUE'], final_order, final_seasonal, simple_diff=True)
-    final_res = _fit_robust(final_model_sd, maxiter=600, stage='fine')
+    final_res = _fit_robust(final_model_sd, maxiter=max(COARSE_MAXITER, FINE_MAXITER, 600), stage='fine')
 if final_res is None:
     raise RuntimeError('最终模型多优化器尝试仍未收敛，请缩小搜索空间或调整差分/季节参数。')
 
@@ -303,7 +391,9 @@ plt.show()
 print('===== 模型选择与结果小结 =====')
 print(f'最优非季节参数 (p,d,q): {final_order}')
 print(f'最优季节参数 (P,D,Q,s): {final_seasonal}')
-print(f'最优模型 AIC: {best_params.AIC:.2f}')
+print(f'最优模型 AIC: {final_row.AIC:.2f}')
 print(f'测试集 MSE: {mse:.4f}')
+print('两阶段配置: COARSE_MAXITER={} FINE_MAXITER={} TOP_K={} SMALL_GAP={} FINE_EXPAND={}'.format(
+    COARSE_MAXITER, FINE_MAXITER, TOP_K, SMALL_GAP, FINE_EXPAND))
 print('并发设置 n_jobs={}，BLAS 线程固定为 1；未收敛模型已自动剔除。'.format(_get_n_jobs()))
-print('若仍有收敛困难：尝试缩小 p/q/P/Q，或仅保留 s=[60]，或开启 simple_differencing（已在回退链中自动尝试）。')
+print('如需进一步提升，可减少搜索空间、或加入外生变量 (exog)。')
